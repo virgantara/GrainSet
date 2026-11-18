@@ -1,15 +1,20 @@
 import albumentations as A
-from albumentations import (RandomBrightness,RandomContrast,HueSaturationValue,Normalize,HorizontalFlip,VerticalFlip,Blur,
-                            MotionBlur,OneOf,MedianBlur,IAAAdditiveGaussianNoise,GaussNoise,OpticalDistortion,RGBShift,RandomCrop,
-                            Cutout,Resize,RandomResizedCrop,GaussianBlur,RandomSizedCrop)
 from albumentations.pytorch import ToTensorV2
 
 import numpy as np
 import torch
-import imgaug as ia
-import imgaug.augmenters as iaa
+
 
 def get_augmentor():
+    # imgaug is an optional dependency. ResNet50 training uses get_transforms(),
+    # so do not require imgaug just to import this module.
+    try:
+        import imgaug.augmenters as iaa
+    except ImportError as exc:
+        raise ImportError(
+            "get_augmentor() requires imgaug. Install it separately if needed."
+        ) from exc
+
     seq = iaa.Sequential([
         iaa.Crop(px=(0, 16)),
         iaa.Fliplr(0.5),
@@ -45,49 +50,53 @@ def mixmatch(x, y, u, model, augment_fn, T=0.5, K=2, alpha=0.75):
     return X, p, U, q
  
 
-def get_transforms(RandBright_limit=0.15, RandBright_ratio=0.3,RandContra_limit=0.15,RandContra_ratio=0.3):
-
-    MEANS = (0.308562, 0.251994, 0.187898) # RGB
-    STDS  = (0.240441, 0.197289, 0.149387) # RGB
-
-    MEANS = MEANS[::-1]
-    STDS  = STDS[::-1]
+def get_transforms(RandBright_limit=0.15, RandBright_ratio=0.3,
+                   RandContra_limit=0.15, RandContra_ratio=0.3):
+    # Input images are read with cv2.imread() in BGR order.
+    means_rgb = (0.308562, 0.251994, 0.187898)
+    stds_rgb = (0.240441, 0.197289, 0.149387)
+    means_bgr = means_rgb[::-1]
+    stds_bgr = stds_rgb[::-1]
 
     train_transform = A.Compose([
-
-        OneOf([
-            Resize(256,256),
-            Resize(224,224),
-            Resize(256,224),
-            Resize(224,256),
-        ],p=1),
-        
-        RandomCrop(224,224),
-        # Cutout(num_holes=4,max_h_size=6,max_w_size=6,p=0.3),
-        HorizontalFlip(),
-        VerticalFlip(),
-        RandomBrightness(limit=RandBright_limit,p=RandBright_ratio),
-        RandomContrast(limit=RandContra_limit,p=RandContra_ratio),
-        # HueSaturationValue(hue_shift_limit=20,sat_shift_limit=25,val_shift_limit=20,p=0.1),
-        RGBShift(20,20,20,p=0.3),
-        OneOf([
-            # 模糊相关操作
-            MedianBlur(blur_limit=5, p=0.3),
-            Blur(blur_limit=5, p=0.3),
-            GaussianBlur(),
+        A.OneOf([
+            A.Resize(256, 256),
+            A.Resize(224, 224),
+            A.Resize(256, 224),
+            A.Resize(224, 256),
+        ], p=1),
+        A.RandomCrop(224, 224),
+        A.HorizontalFlip(),
+        A.VerticalFlip(),
+        # Equivalent to legacy RandomBrightness (no contrast change).
+        A.RandomBrightnessContrast(
+            brightness_limit=RandBright_limit,
+            contrast_limit=0,
+            p=RandBright_ratio,
+        ),
+        # Equivalent to legacy RandomContrast (no brightness change).
+        A.RandomBrightnessContrast(
+            brightness_limit=0,
+            contrast_limit=RandContra_limit,
+            p=RandContra_ratio,
+        ),
+        A.RGBShift(20, 20, 20, p=0.3),
+        A.OneOf([
+            A.MedianBlur(blur_limit=5, p=0.3),
+            A.Blur(blur_limit=5, p=0.3),
+            A.GaussianBlur(),
         ], p=0.3),
-        Normalize(mean=MEANS, std=STDS),
-        ToTensorV2()
+        A.Normalize(mean=means_bgr, std=stds_bgr),
+        ToTensorV2(),
     ])
 
     val_transform = A.Compose([
-        Resize(224,224),
-        Normalize(mean=MEANS, std=STDS),
-        ToTensorV2()
+        A.Resize(224, 224),
+        A.Normalize(mean=means_bgr, std=stds_bgr),
+        ToTensorV2(),
     ])
 
     return train_transform, val_transform
-
 
 
 def mixup_data(x, y, alpha=1.0, use_cuda=True):
@@ -106,4 +115,3 @@ def mixup_data(x, y, alpha=1.0, use_cuda=True):
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
-
