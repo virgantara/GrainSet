@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""GrainSet Rice / ResNet50 / pool-based active learning, budgets 2..50%.
+"""GrainSet Rice: sequential pool-based Active Learning or a single-label-budget run.
 
-Main experiments: Random, LC, Entropy, Margin, Entropy->Diversity.
-Uses original src/models/model.py (timm ResNet50), no BYOL.
+Single mode trains one target budget directly. Uncertainty methods first require
+one shared small labeled-set warmup model; Random needs only one training.
+ResNet50 from original GrainSet, supervised ImageNet initial weights, no BYOL.
 """
 from __future__ import annotations
 
@@ -29,8 +30,16 @@ def args_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--data-root', default=str(ROOT/'datasets/rice'), help='Real image root; e.g. /datasets/rice')
     p.add_argument('--output', default=str(ROOT/'runs/active_learning'))
-    p.add_argument('--methods', nargs='+', choices=METHODS, default=list(METHODS))
-    p.add_argument('--seeds', nargs='+', type=int, default=[42, 123, 509])
+    p.add_argument('--methods', nargs='+', choices=METHODS, default=None,
+                   help='AL methods. In --single-pct mode defaults to random; in sequential mode all methods.')
+    p.add_argument('--seeds', nargs='+', type=int, default=None,
+                   help='Random seeds. Defaults to 42 in single mode, or 42 123 509 in sequential mode.')
+    p.add_argument('--single-pct', type=int, default=None,
+                   help='Train ONLY this labeled budget, e.g. --single-pct 5; no sequential AL rounds.')
+    p.add_argument('--single-initial-pct', type=int, default=2,
+                   help='Initial labeled budget for uncertainty/hybrid queries in single mode. A shared warmup model is trained once per seed.')
+    p.add_argument('--single-eval-test', action='store_true',
+                   help='Also evaluate the fixed test set for a single-budget run (do not use test results for model selection).')
     p.add_argument('--start-pct', type=int, default=2)
     p.add_argument('--max-pct', type=int, default=50)
     p.add_argument('--step-pct', type=int, default=2)
@@ -57,7 +66,12 @@ def args_parser():
     p.add_argument('--bag-repetitions', type=int, default=30)
     p.add_argument('--bag-sizes', type=int, nargs='+', default=[100, 200, 500])
     p.add_argument('--bag-rates', type=float, nargs='+', default=[0.01, 0.02, 0.05, 0.10])
-    return p.parse_args()
+    args = p.parse_args()
+    if args.methods is None:
+        args.methods = ['random'] if args.single_pct is not None else list(METHODS)
+    if args.seeds is None:
+        args.seeds = [42] if args.single_pct is not None else [42, 123, 509]
+    return args
 
 
 def atomic_json(data, path):
@@ -125,6 +139,147 @@ def acquire(model, manifest, labeled, n_required, method, args, eval_tf, device,
     return select_indices(method, pool, n_required, probabilities, embeddings,
                           seed=seed+10007*round_i,
                           candidate_multiplier=args.candidate_multiplier)
+
+
+
+def single_settings(args):
+    """Settings saved per run; prevents silently resuming with changed hyperparams."""
+    return {**config_key(args, args.data_root), 'single_pct': args.single_pct,
+            'single_initial_pct': args.single_initial_pct,
+            'single_eval_test': args.single_eval_test}
+
+
+def single_init_indices(train_size, seed, count):
+    # Same initial samples for random and all uncertainty methods at a given seed.
+    return np.random.default_rng(seed).permutation(train_size)[:count].tolist()
+
+
+def save_single_sample_list(file_path, manifest, indices):
+    csv_write(file_path, [{'index': int(i), 'path': manifest.paths[i],
+                           'revealed_label': int(manifest.labels[i])}
+                          for i in indices])
+
+
+def run_single_warmup(seed, train, val, args, device, train_tf, eval_tf,
+                      initial_indices, output_root):
+    """Train one shared supervised seed model for uncertainty acquisition.
+
+    A 5% entropy/hybrid experiment cannot acquire 5% labels from an untrained
+    classifier; initial 2% supervised warmup is a real prerequisite.
+    """
+    warm_dir = output_root/'_warmup'/f'seed_{seed}'
+    warm_dir.mkdir(parents=True, exist_ok=True)
+    result_file = warm_dir/'result.json'
+    checkpoint = warm_dir/'best.pt'
+    settings = single_settings(args)
+    if result_file.exists():
+        saved = json.loads(result_file.read_text(encoding='utf8'))
+        if saved['config'] != settings or saved['initial_indices'] != initial_indices:
+            raise RuntimeError(f'Changed warmup settings at {result_file}. Use another --output directory.')
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f'Warmup checkpoint not found: {checkpoint}')
+        print(f'[warmup seed={seed}] Reusing trained {len(initial_indices)}-image model: {checkpoint}')
+        return checkpoint
+    print(f'\n[warmup seed={seed}] Train ResNet50 on {len(initial_indices)} initial labels', flush=True)
+    round_seed = int(seed) + 300003
+    seed_everything(round_seed, args.deterministic)
+    model = make_model(args.backend, pretrained=args.pretrained and not (warm_dir/'last.pt').exists()).to(device)
+    info = train_round(model,
+                       LabeledDataset(train, initial_indices, train_tf),
+                       LabeledDataset(val, np.arange(len(val)), eval_tf),
+                       args, warm_dir, device, round_seed)
+    save_single_sample_list(warm_dir/'initial_samples.csv', train, initial_indices)
+    atomic_json({'config': settings, 'seed': seed, 'initial_indices': initial_indices,
+                 'best_epoch': info['best_epoch']}, result_file)
+    del model
+    if str(device).startswith('cuda'): torch.cuda.empty_cache()
+    return checkpoint
+
+
+def run_single(method, seed, train, val, test, args, device, train_tf, eval_tf, output_root):
+    """Train exactly one TARGET labeled-budget classifier, no prior AL rounds.
+
+    Random:  one classifier training at the requested percentage.
+    Others: a shared supervised initial-pct model -> query to target -> one
+            target classifier training, for a scientifically valid AL query.
+    """
+    target = round(len(train) * args.single_pct / 100)
+    start_count = round(len(train) * args.single_initial_pct / 100)
+    if not (1 <= start_count <= target <= len(train)):
+        raise ValueError('Single initial count must be >=1 and <= target count')
+    initial = single_init_indices(len(train), seed, start_count)
+    settings = single_settings(args)
+    out = output_root/method/f'seed_{seed}'
+    out.mkdir(parents=True, exist_ok=True)
+    result_file = out/'result.json'
+    selection_file = out/'selection.json'
+    if result_file.exists():
+        saved = json.loads(result_file.read_text(encoding='utf8'))
+        if saved['config'] != settings:
+            raise RuntimeError(f'Changed settings at {result_file}. Use another --output directory.')
+        print(f'[single {method} seed={seed}] {args.single_pct}% already completed; skipping')
+        return
+    if selection_file.exists():
+        selection = json.loads(selection_file.read_text(encoding='utf8'))
+        if selection['config'] != settings or selection['seed'] != seed or selection['method'] != method:
+            raise RuntimeError(f'Saved acquisition does not match settings: {selection_file}')
+        labeled = [int(i) for i in selection['labeled_indices']]
+        if len(labeled) != target or len(set(labeled)) != target:
+            raise AssertionError('Saved target pool has wrong size or duplicate indices')
+        if not set(initial).issubset(labeled):
+            raise AssertionError('Saved target pool differs from initial seed pool')
+        queried = [int(i) for i in selection['queried_indices']]
+        print(f'[single {method} seed={seed}] Reusing saved selection {args.single_pct}%')
+    else:
+        if method == 'random':
+            labeled = single_init_indices(len(train), seed, target)
+            queried = labeled[start_count:]
+        else:
+            if target == start_count:
+                labeled, queried = initial, []
+            else:
+                checkpoint = run_single_warmup(seed, train, val, args, device,
+                                              train_tf, eval_tf, initial, output_root)
+                query_model = make_model(args.backend, pretrained=False).to(device)
+                load_weights(query_model, checkpoint, device)
+                queried = acquire(query_model, train, initial, target-start_count,
+                                  method, args, eval_tf, device, seed,
+                                  round_i=1).tolist()
+                del query_model
+                if str(device).startswith('cuda'): torch.cuda.empty_cache()
+                labeled = initial + queried
+        if len(labeled) != target or len(set(labeled)) != target:
+            raise AssertionError('Single target selection is wrong or contains duplicates')
+        atomic_json({'config': settings, 'method': method, 'seed': seed,
+                     'initial_indices': initial, 'queried_indices': queried,
+                     'labeled_indices': labeled}, selection_file)
+    save_single_sample_list(out/'labeled_samples.csv', train, labeled)
+    print(f'\n[single {method} seed={seed}] Target={args.single_pct}% '
+          f'({target} labels); initial={start_count}, queried={len(queried)}', flush=True)
+    round_seed = int(seed) + 300003
+    seed_everything(round_seed, args.deterministic)
+    model = make_model(args.backend, pretrained=args.pretrained and not (out/'last.pt').exists()).to(device)
+    tic = time.perf_counter()
+    info = train_round(model, LabeledDataset(train, labeled, train_tf),
+                       LabeledDataset(val, np.arange(len(val)), eval_tf),
+                       args, out, device, round_seed)
+    val_info = evaluate_and_save(model, val, eval_tf, args, device, out, 'val', seed)
+    row = {'method': method, 'seed': seed, 'round': 0,
+           'label_pct': args.single_pct, 'labeled_count': target,
+           'initial_count': start_count, 'acquired': len(queried),
+           'training_seconds': round(time.perf_counter()-tic,2),
+           'best_epoch': info['best_epoch'],
+           **{f'val_{k}': v for k, v in val_info.items()}}
+    if args.single_eval_test:
+        test_info = evaluate_and_save(model, test, eval_tf, args, device, out, 'test', seed)
+        row.update({f'test_{k}': v for k, v in test_info.items()})
+    csv_write(out/'history.csv', [row])
+    atomic_json({'config': settings, 'metrics': row}, result_file)
+    print(f"  val top1={val_info['top1']:.2f} top2={val_info['top2']:.2f} "
+          f"macro_f1={val_info['macro_f1']:.2f} MAPE={val_info['clean_mape_soft']:.3f}%", flush=True)
+    del model
+    if str(device).startswith('cuda'): torch.cuda.empty_cache()
+
 
 
 def run_al(method, seed, train, val, test, args, device, train_tf, eval_tf, schedule, output_root):
@@ -268,10 +423,51 @@ def main():
     print('No BYOL. ImageNet supervised pretrained:', args.pretrained)
     if args.epochs < 1 or args.patience < 1 or args.batch_size < 1 or args.pool_batch_size < 1:
         raise ValueError('Epochs, patience and batch sizes must be positive')
+    if args.single_pct is not None:
+        if not (1 <= args.single_pct <= 100):
+            raise ValueError('--single-pct must be between 1 and 100')
+        if not (1 <= args.single_initial_pct <= args.single_pct):
+            raise ValueError('--single-initial-pct must be between 1 and --single-pct')
+        if args.max_rounds is not None:
+            raise ValueError('--max-rounds is only for sequential AL mode, not --single-pct')
     train = read_manifest(args.data_root, 'train')
     val = read_manifest(args.data_root, 'val')
     test = read_manifest(args.data_root, 'test')
     verify_manifests(train, val, test, check_files=not args.skip_file_check and not args.dry_run)
+    if args.single_pct is not None:
+        count = round(len(train) * args.single_pct / 100)
+        initial_count = round(len(train) * args.single_initial_pct / 100)
+        if not (1 <= initial_count <= count):
+            raise ValueError('Rounded initial label count must be >=1 and <= target count')
+        print(f'Train={len(train)}, val={len(val)}, test={len(test)}')
+        print(f'SINGLE MODE: {args.single_pct}% = {count} labeled images, '
+              f'{args.single_initial_pct}% initial = {initial_count}; '
+              f'methods={args.methods}; seeds={args.seeds}')
+        if any(m != 'random' for m in args.methods) and count > initial_count:
+            print('Note: uncertainty/hybrid methods train one shared '
+                  f'{args.single_initial_pct}% warmup model per seed before the target model.')
+        if args.dry_run:
+            print('DRY RUN: no training started. (Image existence check skipped.)')
+            return
+        if args.skip_file_check:
+            print('WARNING: Image file checks skipped; loader may fail if paths are missing.')
+        train_tf, eval_tf = make_transforms(args.image_size)
+        output_root = Path(args.output).expanduser().resolve()/f'single_{args.single_pct}pct'
+        output_root.mkdir(parents=True, exist_ok=True)
+        atomic_json({'mode':'single', 'data_root': args.data_root,
+                     'split_sizes': {'train':len(train),'val':len(val),'test':len(test)},
+                     'settings': single_settings(args), 'methods':args.methods,
+                     'seeds': args.seeds, 'label_pct': args.single_pct,
+                     'labeled_count': count, 'initial_count': initial_count},
+                    output_root/'experiment.json')
+        for seed in args.seeds:
+            if args.include_full:
+                run_full(seed, train, val, test, args, device, train_tf, eval_tf, output_root)
+            for method in args.methods:
+                run_single(method, seed, train, val, test, args, device, train_tf,
+                           eval_tf, output_root)
+        print('\nFinished single-budget experiment. Run: python src/plot_al.py --input', output_root)
+        return
     schedule = budgets(len(train), args.start_pct, args.max_pct, args.step_pct)
     print(f'Train={len(train)}, val={len(val)}, test={len(test)}, rounds={len(schedule)}')
     print('Budget:', ' '.join(f'R{i}:{pct}%={count}' for i,(pct,count) in enumerate(schedule)))
