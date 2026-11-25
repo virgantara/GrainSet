@@ -31,11 +31,17 @@ def args_parser():
     p.add_argument('--data-root', default=str(ROOT/'datasets/rice'), help='Real image root; e.g. /datasets/rice')
     p.add_argument('--output', default=str(ROOT/'runs/active_learning'))
     p.add_argument('--methods', nargs='+', choices=METHODS, default=None,
-                   help='AL methods. In --single-pct mode defaults to random; in sequential mode all methods.')
+                   help='AL methods; in --single-pct mode exactly ONE method is allowed.')
+    p.add_argument('--method', choices=METHODS, default=None,
+                   help='Single-method shortcut, e.g. --method entropy.')
     p.add_argument('--seeds', nargs='+', type=int, default=None,
-                   help='Random seeds. Defaults to 42 in single mode, or 42 123 509 in sequential mode.')
+                   help='Random seeds. In --single-pct mode exactly ONE seed is allowed.')
+    p.add_argument('--seed', type=int, default=None,
+                   help='Single-seed shortcut, e.g. --seed 42.')
     p.add_argument('--single-pct', type=int, default=None,
                    help='Train ONLY this labeled budget, e.g. --single-pct 5; no sequential AL rounds.')
+    p.add_argument('--continue-from-pct', type=int, default=None,
+                   help='Progressive single-budget AL: reuse previous labeled set and checkpoint, e.g. 5 then 10. One classifier training per invocation.')
     p.add_argument('--single-initial-pct', type=int, default=2,
                    help='Initial labeled budget for uncertainty/hybrid queries in single mode. A shared warmup model is trained once per seed.')
     p.add_argument('--single-eval-test', action='store_true',
@@ -55,7 +61,8 @@ def args_parser():
     p.add_argument('--patience', type=int, default=10)
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--weight-decay', type=float, default=1e-4)
-    p.add_argument('--workers', type=int, default=4)
+    p.add_argument('--workers', type=int, default=0,
+                   help='DataLoader worker processes; 0 (default) prevents Too many open files.')
     p.add_argument('--image-size', type=int, default=224)
     p.add_argument('--candidate-multiplier', type=int, default=3)
     p.add_argument('--keep-checkpoints', choices=['latest','all'], default='latest')
@@ -67,10 +74,25 @@ def args_parser():
     p.add_argument('--bag-sizes', type=int, nargs='+', default=[100, 200, 500])
     p.add_argument('--bag-rates', type=float, nargs='+', default=[0.01, 0.02, 0.05, 0.10])
     args = p.parse_args()
+    if args.method is not None:
+        if args.methods is not None:
+            p.error('Use --method OR --methods, not both')
+        args.methods = [args.method]
+    if args.seed is not None:
+        if args.seeds is not None:
+            p.error('Use --seed OR --seeds, not both')
+        args.seeds = [args.seed]
     if args.methods is None:
         args.methods = ['random'] if args.single_pct is not None else list(METHODS)
     if args.seeds is None:
         args.seeds = [42] if args.single_pct is not None else [42, 123, 509]
+    if args.single_pct is not None:
+        if len(args.methods) != 1:
+            p.error('Single run accepts ONE method. Use --method entropy (NOT --methods random entropy hybrid).')
+        if len(args.seeds) != 1:
+            p.error('Single run accepts ONE seed. Use --seed 42.')
+    if args.continue_from_pct is not None and args.single_pct is None:
+        p.error('--continue-from-pct is only valid with --single-pct')
     return args
 
 
@@ -146,7 +168,15 @@ def single_settings(args):
     """Settings saved per run; prevents silently resuming with changed hyperparams."""
     return {**config_key(args, args.data_root), 'single_pct': args.single_pct,
             'single_initial_pct': args.single_initial_pct,
+            'continue_from_pct': args.continue_from_pct,
             'single_eval_test': args.single_eval_test}
+
+
+def single_config_matches(saved, current):
+    """Backward compatible with single-pct runs saved before progressive mode."""
+    old = dict(saved)
+    old.setdefault('continue_from_pct', None)
+    return old == current
 
 
 def single_init_indices(train_size, seed, count):
@@ -174,7 +204,7 @@ def run_single_warmup(seed, train, val, args, device, train_tf, eval_tf,
     settings = single_settings(args)
     if result_file.exists():
         saved = json.loads(result_file.read_text(encoding='utf8'))
-        if saved['config'] != settings or saved['initial_indices'] != initial_indices:
+        if not single_config_matches(saved['config'], settings) or saved['initial_indices'] != initial_indices:
             raise RuntimeError(f'Changed warmup settings at {result_file}. Use another --output directory.')
         if not checkpoint.is_file():
             raise FileNotFoundError(f'Warmup checkpoint not found: {checkpoint}')
@@ -206,7 +236,7 @@ def run_single(method, seed, train, val, test, args, device, train_tf, eval_tf, 
     target = round(len(train) * args.single_pct / 100)
     start_count = round(len(train) * args.single_initial_pct / 100)
     if not (1 <= start_count <= target <= len(train)):
-        raise ValueError('Single initial count must be >=1 and <= target count')
+        raise ValueError('Initial labeled count must be >=1 and <= target')
     initial = single_init_indices(len(train), seed, start_count)
     settings = single_settings(args)
     out = output_root/method/f'seed_{seed}'
@@ -215,43 +245,99 @@ def run_single(method, seed, train, val, test, args, device, train_tf, eval_tf, 
     selection_file = out/'selection.json'
     if result_file.exists():
         saved = json.loads(result_file.read_text(encoding='utf8'))
-        if saved['config'] != settings:
-            raise RuntimeError(f'Changed settings at {result_file}. Use another --output directory.')
+        if not single_config_matches(saved['config'], settings):
+            raise RuntimeError(f'Changed settings at {result_file}. Use a different --output directory.')
         print(f'[single {method} seed={seed}] {args.single_pct}% already completed; skipping')
         return
+
     if selection_file.exists():
         selection = json.loads(selection_file.read_text(encoding='utf8'))
-        if selection['config'] != settings or selection['seed'] != seed or selection['method'] != method:
-            raise RuntimeError(f'Saved acquisition does not match settings: {selection_file}')
+        if not single_config_matches(selection['config'], settings) or selection['seed'] != seed or selection['method'] != method:
+            raise RuntimeError(f'Saved selection has different settings: {selection_file}')
         labeled = [int(i) for i in selection['labeled_indices']]
-        if len(labeled) != target or len(set(labeled)) != target:
-            raise AssertionError('Saved target pool has wrong size or duplicate indices')
-        if not set(initial).issubset(labeled):
-            raise AssertionError('Saved target pool differs from initial seed pool')
         queried = [int(i) for i in selection['queried_indices']]
+        prev_count = int(selection.get('previous_labeled_count', start_count))
+        if len(labeled) != target or len(set(labeled)) != target:
+            raise AssertionError('Saved target pool has incorrect count / duplicates')
+        if not set(initial).issubset(labeled):
+            raise AssertionError('Saved selected pool does not contain the initial 2% set')
+        if len(queried) != target-prev_count:
+            raise AssertionError('Saved acquired sample count is inconsistent')
         print(f'[single {method} seed={seed}] Reusing saved selection {args.single_pct}%')
     else:
-        if method == 'random':
+        if args.continue_from_pct is not None:
+            old_pct = int(args.continue_from_pct)
+            if not (1 <= old_pct < args.single_pct):
+                raise ValueError('--continue-from-pct must be lower than --single-pct')
+            prev_dir = output_root.parent/f'single_{old_pct}pct'/method/f'seed_{seed}'
+            prev_selection = prev_dir/'selection.json'
+            prev_result = prev_dir/'result.json'
+            prev_checkpoint = prev_dir/'best.pt'
+            missing = [str(f) for f in (prev_selection, prev_result, prev_checkpoint) if not f.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    f'Cannot continue {old_pct}% -> {args.single_pct}%. Missing: {missing}. '
+                    f'Run --single-pct {old_pct} --method {method} --seed {seed} first.')
+            sel = json.loads(prev_selection.read_text(encoding='utf8'))
+            result = json.loads(prev_result.read_text(encoding='utf8'))
+            if sel.get('method') != method or int(sel.get('seed', -1)) != seed:
+                raise RuntimeError('Previous selection does not match method or seed')
+            # Prevent silently comparing AL runs with differing model/training settings.
+            prev_cfg = result.get('config', {})
+            current_cfg = config_key(args, args.data_root)
+            if any(prev_cfg.get(k) != v for k, v in current_cfg.items()):
+                raise RuntimeError('Training hyperparameters differ from previous percentage. '
+                                   'Use the same parameters and output directory.')
+            previous = [int(i) for i in sel['labeled_indices']]
+            expected = round(len(train)*old_pct/100)
+            if len(previous) != expected or len(set(previous)) != expected:
+                raise AssertionError('Previous labeled set size or uniqueness is invalid')
+            if not set(initial).issubset(previous):
+                raise AssertionError('Previous labeled set differs from initial seed set')
+            prev_count = len(previous)
+            needed = target-prev_count
+            if method == 'random':
+                queried = acquire(None, train, previous, needed, method, args,
+                                  eval_tf, device, seed, round_i=args.single_pct).tolist()
+            else:
+                query_model = make_model(args.backend, pretrained=False).to(device)
+                load_weights(query_model, prev_checkpoint, device)
+                queried = acquire(query_model, train, previous, needed, method, args,
+                                  eval_tf, device, seed, round_i=args.single_pct).tolist()
+                del query_model
+                if str(device).startswith('cuda'): torch.cuda.empty_cache()
+            labeled = previous + queried
+            print(f'[single {method} seed={seed}] Incremental AL '
+                  f'{old_pct}% -> {args.single_pct}%: +{needed} labels', flush=True)
+        elif method == 'random':
             labeled = single_init_indices(len(train), seed, target)
             queried = labeled[start_count:]
+            prev_count = start_count
         else:
             if target == start_count:
                 labeled, queried = initial, []
             else:
+                # Direct single-budget mode needs a 2% labeled warmup for
+                # uncertainty sampling. For exactly one training per command,
+                # first train 2%, then use --continue-from-pct 2.
                 checkpoint = run_single_warmup(seed, train, val, args, device,
                                               train_tf, eval_tf, initial, output_root)
                 query_model = make_model(args.backend, pretrained=False).to(device)
                 load_weights(query_model, checkpoint, device)
                 queried = acquire(query_model, train, initial, target-start_count,
-                                  method, args, eval_tf, device, seed,
-                                  round_i=1).tolist()
+                                  method, args, eval_tf, device, seed, round_i=1).tolist()
                 del query_model
                 if str(device).startswith('cuda'): torch.cuda.empty_cache()
                 labeled = initial + queried
+            prev_count = start_count
         if len(labeled) != target or len(set(labeled)) != target:
-            raise AssertionError('Single target selection is wrong or contains duplicates')
+            raise AssertionError('Selected pool has incorrect count / duplicates')
+        if any(i < 0 or i >= len(train) for i in labeled):
+            raise AssertionError('Selected pool contains out-of-bounds index')
         atomic_json({'config': settings, 'method': method, 'seed': seed,
                      'initial_indices': initial, 'queried_indices': queried,
+                     'previous_labeled_count': prev_count,
+                     'continued_from_pct': args.continue_from_pct,
                      'labeled_indices': labeled}, selection_file)
     save_single_sample_list(out/'labeled_samples.csv', train, labeled)
     print(f'\n[single {method} seed={seed}] Target={args.single_pct}% '
@@ -424,6 +510,8 @@ def main():
     if args.epochs < 1 or args.patience < 1 or args.batch_size < 1 or args.pool_batch_size < 1:
         raise ValueError('Epochs, patience and batch sizes must be positive')
     if args.single_pct is not None:
+        if args.continue_from_pct is not None and not (1 <= args.continue_from_pct < args.single_pct):
+            raise ValueError('--continue-from-pct must be smaller than --single-pct')
         if not (1 <= args.single_pct <= 100):
             raise ValueError('--single-pct must be between 1 and 100')
         if not (1 <= args.single_initial_pct <= args.single_pct):
@@ -443,7 +531,10 @@ def main():
         print(f'SINGLE MODE: {args.single_pct}% = {count} labeled images, '
               f'{args.single_initial_pct}% initial = {initial_count}; '
               f'methods={args.methods}; seeds={args.seeds}')
-        if any(m != 'random' for m in args.methods) and count > initial_count:
+        if args.continue_from_pct is not None:
+            print(f'PROGRESSIVE MODE: target {args.single_pct}%, '
+                  f'continue from completed {args.continue_from_pct}%.')
+        elif any(m != 'random' for m in args.methods) and count > initial_count:
             print('Note: uncertainty/hybrid methods train one shared '
                   f'{args.single_initial_pct}% warmup model per seed before the target model.')
         if args.dry_run:

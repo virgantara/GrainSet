@@ -66,7 +66,7 @@ def make_loader(dataset, batch_size, workers, shuffle=False, seed=0, device='cpu
     gen.manual_seed(int(seed))
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers,
                       pin_memory=str(device).startswith('cuda'), drop_last=False,
-                      generator=gen, persistent_workers=workers > 0)
+                      generator=gen, persistent_workers=False)
 
 
 def classify(y, prob):
@@ -163,8 +163,11 @@ def train_round(model, train_ds, val_ds, cfg, output_dir, device, round_seed):
             scaler.update()
             loss_sum += loss.item() * len(labels)
             n += len(labels)
+        # Release train-loader workers before spawning validation workers.
+        del train_loader
         eval_loader = make_loader(val_ds, cfg.batch_size, cfg.workers, device=device)
         _, val_y, val_p, _ = inference(model, eval_loader, device)
+        del eval_loader
         val_stats, _ = classify(val_y, val_p)
         scheduler.step()
         improved = val_stats['macro_f1'] > best_f1 + 1e-6
