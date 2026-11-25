@@ -175,8 +175,59 @@ def single_settings(args):
 def single_config_matches(saved, current):
     """Backward compatible with single-pct runs saved before progressive mode."""
     old = dict(saved)
+    new = dict(current)
     old.setdefault('continue_from_pct', None)
-    return old == current
+    new.setdefault('continue_from_pct', None)
+    return old == new
+
+
+def can_reuse_legacy_random_target(saved_config, current_config, method, seed,
+                                   initial_indices, target_indices, previous_pct,
+                                   output_root, train_size):
+    """Accept completed legacy Random runs without changing any saved files.
+
+    Legacy single-budget Random sampling used a prefix of a fixed permutation,
+    so it is nested: the 2% selection is included in the already trained 5%.
+    Only `continue_from_pct` may differ; all model/data hyperparameters must
+    match and the requested previous labeled set must be a subset of the target.
+    """
+    if method != 'random' or previous_pct is None:
+        return False, 'not a legacy Random continuation'
+    old = dict(saved_config)
+    old.setdefault('continue_from_pct', None)
+    if old.get('continue_from_pct') is not None:
+        return False, 'legacy run was itself progressive from a different percentage'
+    current_without_parent = dict(current_config)
+    current_without_parent['continue_from_pct'] = None
+    if old != current_without_parent:
+        return False, 'training settings differ beyond continue-from-pct'
+
+    parent = output_root.parent / f'single_{previous_pct}pct' / method / f'seed_{seed}'
+    parent_result, parent_selection = parent / 'result.json', parent / 'selection.json'
+    if not parent_result.is_file() or not parent_selection.is_file():
+        return False, f'previous {previous_pct}% Random result/selection not found: {parent}'
+    parent_info = json.loads(parent_result.read_text(encoding='utf8'))
+    parent_pool = json.loads(parent_selection.read_text(encoding='utf8'))
+    if parent_pool.get('method') != method or int(parent_pool.get('seed', -1)) != int(seed):
+        return False, 'previous method or seed differs'
+    if any(parent_info.get('config', {}).get(k) != v
+           for k, v in config_key_from_single(current_config).items()):
+        return False, 'previous training settings differ'
+    parent_indices = [int(i) for i in parent_pool['labeled_indices']]
+    expected_parent = round(train_size * previous_pct / 100)
+    if len(parent_indices) != expected_parent or len(set(parent_indices)) != expected_parent:
+        return False, 'previous labeled pool size is wrong or contains duplicates'
+    if not set(initial_indices).issubset(parent_indices):
+        return False, 'previous pool does not contain initial labeled samples'
+    if not set(parent_indices).issubset(target_indices):
+        return False, 'existing target pool does not contain previous labeled pool'
+    return True, 'validated nested Random subsets and unchanged model/data settings'
+
+
+def config_key_from_single(config):
+    """Base hyperparameters, excluding metadata specific to the single run."""
+    keys = {'single_pct', 'single_initial_pct', 'continue_from_pct', 'single_eval_test'}
+    return {k: v for k, v in config.items() if k not in keys}
 
 
 def single_init_indices(train_size, seed, count):
@@ -246,7 +297,34 @@ def run_single(method, seed, train, val, test, args, device, train_tf, eval_tf, 
     if result_file.exists():
         saved = json.loads(result_file.read_text(encoding='utf8'))
         if not single_config_matches(saved['config'], settings):
-            raise RuntimeError(f'Changed settings at {result_file}. Use a different --output directory.')
+            # A previously completed random 5% run may have been produced
+            # before the explicit progressive option was added. As long as
+            # the 2% labeled set is a subset and the model/data settings are
+            # identical, it remains a valid Random baseline: do NOT retrain.
+            reusable = False
+            reason = 'could not inspect the saved sample selection'
+            if selection_file.is_file():
+                old_selection = json.loads(selection_file.read_text(encoding='utf8'))
+                target_ids = [int(i) for i in old_selection.get('labeled_indices', [])]
+                if (old_selection.get('method') == method and
+                        int(old_selection.get('seed', -1)) == int(seed) and
+                        len(target_ids) == target and len(set(target_ids)) == target and
+                        single_config_matches(old_selection.get('config', {}), saved['config'])):
+                    reusable, reason = can_reuse_legacy_random_target(
+                        saved['config'], settings, method, seed, initial,
+                        target_ids, args.continue_from_pct, output_root, len(train))
+                else:
+                    reason = 'existing target selection differs from completed run'
+            if reusable:
+                print(f'[single {method} seed={seed}] Existing {args.single_pct}% '
+                      f'Random model is compatible with progressive '
+                      f'{args.continue_from_pct}% -> {args.single_pct}% ({reason}).')
+                print('  Reusing completed training unchanged; no checkpoints or results overwritten.')
+                return
+            raise RuntimeError(
+                f'Changed settings at {result_file}. Cannot safely reuse existing '
+                f'{args.single_pct}% result ({reason}). Existing files are untouched. '
+                f'Use a different --output directory to retrain.')
         print(f'[single {method} seed={seed}] {args.single_pct}% already completed; skipping')
         return
 
@@ -273,7 +351,9 @@ def run_single(method, seed, train, val, test, args, device, train_tf, eval_tf, 
             prev_selection = prev_dir/'selection.json'
             prev_result = prev_dir/'result.json'
             prev_checkpoint = prev_dir/'best.pt'
-            missing = [str(f) for f in (prev_selection, prev_result, prev_checkpoint) if not f.is_file()]
+            # Random acquisition needs the previous selected pool, not model weights.
+            required = (prev_selection, prev_result) if method == 'random' else (prev_selection, prev_result, prev_checkpoint)
+            missing = [str(f) for f in required if not f.is_file()]
             if missing:
                 raise FileNotFoundError(
                     f'Cannot continue {old_pct}% -> {args.single_pct}%. Missing: {missing}. '
